@@ -11,6 +11,44 @@ mod serde;
 
 use crate::traits::SequenceAlloc;
 
+/// Errors that can occur during sequence operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceError {
+    /// Sequence initialization failed (memory allocation or C function returned false)
+    InitializationFailed,
+    /// Sequence copy/clone operation failed
+    AllocationFailed,
+    /// Sequence length exceeds the upper bound for a bounded sequence
+    BoundsExceeded {
+        /// The actual length the sequence would have after the operation
+        len: usize,
+        /// The upper bound on the sequence length
+        upper_bound: usize,
+    },
+}
+
+impl Display for SequenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SequenceError::InitializationFailed => {
+                write!(f, "Sequence initialization failed")
+            }
+            SequenceError::AllocationFailed => {
+                write!(f, "Sequence allocation/copy failed")
+            }
+            SequenceError::BoundsExceeded { len, upper_bound } => {
+                write!(
+                    f,
+                    "Sequence length {} exceeds upper bound {}",
+                    len, upper_bound
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SequenceError {}
+
 /// An unbounded sequence.
 ///
 /// The layout of a concrete `Sequence<T>` is the same as the corresponding `Sequence` struct
@@ -24,7 +62,7 @@ use crate::traits::SequenceAlloc;
 ///
 /// ```
 /// # use rosidl_runtime_rs::{Sequence, seq};
-/// let mut list = Sequence::<i32>::new(3);
+/// let mut list = Sequence::<i32>::new(3).unwrap();
 /// // Sequences deref to slices
 /// assert_eq!(&list[..], &[0, 0, 0]);
 /// list[0] = 3;
@@ -56,7 +94,7 @@ pub struct Sequence<T: SequenceAlloc> {
 ///
 /// ```
 /// # use rosidl_runtime_rs::{BoundedSequence, seq};
-/// let mut list = BoundedSequence::<i32, 5>::new(3);
+/// let mut list = BoundedSequence::<i32, 5>::new(3).unwrap();
 /// // BoundedSequences deref to slices
 /// assert_eq!(&list[..], &[0, 0, 0]);
 /// list[0] = 3;
@@ -74,15 +112,6 @@ pub struct BoundedSequence<T: SequenceAlloc, const N: usize> {
     inner: Sequence<T>,
 }
 
-/// Error type for [`BoundedSequence::try_new()`].
-#[derive(Debug)]
-pub struct SequenceExceedsBoundsError {
-    /// The actual length the sequence would have after the operation.
-    pub len: usize,
-    /// The upper bound on the sequence length.
-    pub upper_bound: usize,
-}
-
 /// A by-value iterator created by [`Sequence::into_iter()`] and [`BoundedSequence::into_iter()`].
 pub struct SequenceIterator<T: SequenceAlloc> {
     seq: Sequence<T>,
@@ -97,7 +126,10 @@ impl<T: SequenceAlloc> Clone for Sequence<T> {
         if T::sequence_copy(self, &mut seq) {
             seq
         } else {
-            panic!("Cloning Sequence failed")
+            panic!(
+                "Cloning Sequence failed: {}",
+                SequenceError::AllocationFailed
+            )
         }
     }
 }
@@ -149,7 +181,10 @@ impl<T: SequenceAlloc> Extend<T> for Sequence<T> {
         let mut cur_idx = self.size;
         // Convenience closure for resizing self
         let resize = |seq: &mut Self, new_size: usize| {
-            let old_seq = std::mem::replace(seq, Sequence::new(new_size));
+            let old_seq = std::mem::replace(
+                seq,
+                Sequence::new(new_size).expect("Failed to allocate sequence during extend"),
+            );
             for (i, elem) in old_seq.into_iter().enumerate().take(new_size) {
                 seq[i] = elem;
             }
@@ -184,7 +219,7 @@ impl<T: SequenceAlloc> Extend<T> for Sequence<T> {
 
 impl<T: SequenceAlloc + Clone> From<&[T]> for Sequence<T> {
     fn from(slice: &[T]) -> Self {
-        let mut seq = Sequence::new(slice.len());
+        let mut seq = Sequence::new(slice.len()).expect("Failed to allocate sequence from slice");
         seq.clone_from_slice(slice);
         seq
     }
@@ -201,7 +236,7 @@ impl<T: SequenceAlloc> FromIterator<T> for Sequence<T> {
     where
         I: IntoIterator<Item = T>,
     {
-        let mut seq = Sequence::new(0);
+        let mut seq = Sequence::new(0).expect("Failed to allocate empty sequence for from_iter");
         seq.extend(iter);
         seq
     }
@@ -249,12 +284,24 @@ where
     T: SequenceAlloc,
 {
     /// Creates a sequence of `len` elements with default values.
-    pub fn new(len: usize) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `SequenceError::InitializationFailed` if the underlying C initialization fails.
+    pub fn new(len: usize) -> Result<Self, SequenceError> {
         let mut seq = Self::default();
         if !T::sequence_init(&mut seq, len) {
-            panic!("Sequence initialization failed");
+            return Err(SequenceError::InitializationFailed);
         }
-        seq
+        Ok(seq)
+    }
+
+    /// Returns the allocated capacity (maximum number of elements without reallocation).
+    ///
+    /// This is the total space allocated for the sequence, which may be larger than
+    /// the current length returned by `len()`.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Extracts a slice containing the entire sequence.
@@ -336,7 +383,7 @@ impl<T: SequenceAlloc, const N: usize> Extend<T> for BoundedSequence<T, N> {
 }
 
 impl<T: SequenceAlloc + Clone, const N: usize> TryFrom<&[T]> for BoundedSequence<T, N> {
-    type Error = SequenceExceedsBoundsError;
+    type Error = SequenceError;
     fn try_from(slice: &[T]) -> Result<Self, Self::Error> {
         let mut seq = BoundedSequence::try_new(slice.len())?;
         seq.clone_from_slice(slice);
@@ -345,10 +392,10 @@ impl<T: SequenceAlloc + Clone, const N: usize> TryFrom<&[T]> for BoundedSequence
 }
 
 impl<T: SequenceAlloc, const N: usize> TryFrom<Vec<T>> for BoundedSequence<T, N> {
-    type Error = SequenceExceedsBoundsError;
+    type Error = SequenceError;
     fn try_from(v: Vec<T>) -> Result<Self, Self::Error> {
         if v.len() > N {
-            Err(SequenceExceedsBoundsError {
+            Err(SequenceError::BoundsExceeded {
                 len: v.len(),
                 upper_bound: N,
             })
@@ -363,7 +410,7 @@ impl<T: SequenceAlloc, const N: usize> FromIterator<T> for BoundedSequence<T, N>
     where
         I: IntoIterator<Item = T>,
     {
-        let mut seq = BoundedSequence::new(0);
+        let mut seq = BoundedSequence::new(0).expect("Failed to allocate empty bounded sequence");
         seq.extend(iter);
         seq
     }
@@ -415,26 +462,40 @@ where
 {
     /// Creates a sequence of `len` elements with default values.
     ///
-    /// If `len` is greater than `N`, this function panics.
-    pub fn new(len: usize) -> Self {
-        Self::try_new(len).unwrap()
+    /// # Errors
+    ///
+    /// Returns `SequenceError::BoundsExceeded` if `len` is greater than `N`.
+    /// Returns `SequenceError::InitializationFailed` if the underlying C initialization fails.
+    pub fn new(len: usize) -> Result<Self, SequenceError> {
+        Self::try_new(len)
     }
 
     /// Attempts to create a sequence of `len` elements with default values.
     ///
-    /// If `len` is greater than `N`, this function returns an error.
-    pub fn try_new(len: usize) -> Result<Self, SequenceExceedsBoundsError> {
+    /// # Errors
+    ///
+    /// Returns `SequenceError::BoundsExceeded` if `len` is greater than `N`.
+    /// Returns `SequenceError::InitializationFailed` if the underlying C initialization fails.
+    pub fn try_new(len: usize) -> Result<Self, SequenceError> {
         if len > N {
-            return Err(SequenceExceedsBoundsError {
+            return Err(SequenceError::BoundsExceeded {
                 len,
                 upper_bound: N,
             });
         }
         let mut seq = Self::default();
         if !T::sequence_init(&mut seq.inner, len) {
-            panic!("BoundedSequence initialization failed");
+            return Err(SequenceError::InitializationFailed);
         }
         Ok(seq)
+    }
+
+    /// Returns the allocated capacity (maximum number of elements without reallocation).
+    ///
+    /// This is the total space allocated for the sequence, which may be larger than
+    /// the current length returned by `len()`.
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 
     /// Extracts a slice containing the entire sequence.
@@ -485,20 +546,6 @@ impl<T: SequenceAlloc> ExactSizeIterator for SequenceIterator<T> {
 }
 
 impl<T: SequenceAlloc> FusedIterator for SequenceIterator<T> {}
-
-// ========================= impl for StringExceedsBoundsError =========================
-
-impl Display for SequenceExceedsBoundsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "BoundedSequence with upper bound {} initialized with len {}",
-            self.upper_bound, self.len
-        )
-    }
-}
-
-impl std::error::Error for SequenceExceedsBoundsError {}
 
 macro_rules! impl_sequence_alloc_for_primitive_type {
     ($rust_type:ty, $init_func:ident, $fini_func:ident, $copy_func:ident) => {
@@ -627,7 +674,7 @@ macro_rules! seq {
     [$( $elem:expr ),*] => {
         {
             let len = seq!(@count_tts $($elem),*);
-            let mut seq = Sequence::new(len);
+            let mut seq = Sequence::new(len).expect("Failed to allocate sequence in seq! macro");
             let mut i = 0;
             $(
                 seq[i] = $elem;
@@ -640,7 +687,7 @@ macro_rules! seq {
     [$len:literal # $( $elem:expr ),*] => {
         {
             let len = seq!(@count_tts $($elem),*);
-            let mut seq = BoundedSequence::<_, $len>::new(len);
+            let mut seq = BoundedSequence::<_, $len>::new(len).expect("Failed to allocate bounded sequence in seq! macro");
             let mut i = 0;
             $(
                 seq[i] = $elem;
@@ -682,7 +729,7 @@ mod tests {
 
     quickcheck! {
         fn test_extend(xs: Vec<i32>, ys: Vec<i32>) -> bool {
-            let mut xs_seq = Sequence::new(xs.len());
+            let mut xs_seq = Sequence::new(xs.len()).unwrap();
             xs_seq.copy_from_slice(&xs);
             xs_seq.extend(ys.clone());
             if xs_seq.len() != xs.len() + ys.len() {
@@ -700,7 +747,7 @@ mod tests {
 
     quickcheck! {
         fn test_iteration(xs: Vec<i32>) -> bool {
-            let mut seq_1 = Sequence::new(xs.len());
+            let mut seq_1 = Sequence::new(xs.len()).unwrap();
             seq_1.copy_from_slice(&xs);
             let seq_2 = seq_1.clone().into_iter().collect();
             seq_1 == seq_2
